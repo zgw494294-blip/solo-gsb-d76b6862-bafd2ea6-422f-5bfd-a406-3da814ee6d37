@@ -312,11 +312,13 @@ curl -s -i -X POST http://localhost:8080/api/revise \
    * 两侧**连接键始终保留**（它们决定行集合），筛选引用列同样始终保留；
    * 某投影/连接虽被保留但已无任何被需要的输出时，保留其**原第一个输出**及其依赖，
      绝不产生空输出的非法节点（导出节点恒有选定列，不会落入此情形）。
-3. **尾部投影**：**仅当**裁剪后的导出节点仍含未选定列时，才在其后追加一个 ID 不与已有节点
-   冲突的 `projection`（输入即原导出节点），只按**原列序** `copy` 选定列。投影/连接导出已
-   就地只剩选定列时**不追加**；source / filter 无法丢列，选定子集时必须追加。
+3. **尾部投影**：**仅当**裁剪后导出节点**实际仍含未选定列**时，才在其后追加一个 ID 不与已有节点
+   冲突的 `projection`（输入即原导出节点），只按**原列序** `copy` 选定列。导出投影/连接已就地
+   只剩选定列时**不追加**；筛选只是**透传**其输入列——上游投影/连接已缩掉的未选列不会在筛选
+   导出处重新出现，因此筛选导出同样可能无需追加。只有筛选条件 `references`（或源列）把未选列
+   保留下来时（source 永不缩列，source 导出选定子集同理），导出才确实仍含未选列、需要追加。
 4. **节点上限**：仅在确需尾部投影（总节点数变为 61）时才以 `PRUNE_NODE_LIMIT` 拒绝；
-   可就地缩列的 60 节点图成功返回，拒绝时不返回部分图。
+   上游缩列后筛选透传、无需追加的 60 节点图成功返回，拒绝时不返回部分图。
 5. **保持不变量**：保留原节点 ID；保留节点在原请求中的相对顺序，以及节点内列/别名的相对顺序；
    不修改 `sensitive` 标记、常量值与筛选条件。
 6. **语义等价但不“变安全”**：最终导出只含选定列；每个选定列的 `content_reasons` /
@@ -325,8 +327,8 @@ curl -s -i -X POST http://localhost:8080/api/revise \
 ### 拒绝（HTTP 400，不返回部分图）
 
 * 选定列名在导出节点上不存在（即使图本身安全也检查）：`PRUNE_COLUMN_NOT_FOUND`；
-* 裁剪后导出仍含未选定列、且追加尾部投影后节点数**超过 60**：`PRUNE_NODE_LIMIT`
-  （可就地缩列的 60 节点图不追加、不拒绝）；
+* 裁剪后导出仍实际含有未选定列、且追加尾部投影后节点数**超过 60**：`PRUNE_NODE_LIMIT`
+  （可就地缩列、或经筛选透传后已无未选列的 60 节点图不追加、不拒绝）；
 * 构造出的精简图对选定列的复审与原图不一致：`PRUNE_REVIEW_MISMATCH`（内部不变量，正常不会出现）；
 * 以及 `/api/review` 的全部原图校验（`DUPLICATE_NODE` / `COLUMN_CONFLICT` /
   `INVALID_REFERENCE` / `CYCLE`）——整次请求先校验整张原图，无关分支的错误同样拒绝。
@@ -372,8 +374,48 @@ curl -s -X POST http://localhost:8080/api/prune \
 }
 ```
 
-> 若导出节点是 **source / filter**（无法丢列），选定子集时才会在末尾追加一个只复制选定列的
-> 投影（ID 形如 `<导出节点>__export`，冲突时自动换名），`added_projection` 返回其 ID。
+> 是否追加只取决于**裁剪后导出实际暴露的列**：source 永不缩列，source 导出选定子集时必追加；
+> filter 只透传输入列——上游投影/连接已就地缩掉的未选列不会经筛选复活，此时筛选导出**不追加**，
+> 而当筛选条件引用了未选列（或其上游是 source，未选列无法消除）时才追加；追加节点 ID 形如
+> `<导出节点>__export`（冲突时自动换名），`added_projection` 返回其 ID 或 `null`。
+
+筛选导出经上游缩列而无需追加的例子（投影 `p` 就地只剩 `a`，筛选只引用 `a` 并透传，选定 `a`
+时 `added_projection` 为 `null`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/prune \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "a"}, {"name": "b"}]},
+    {"id": "p", "type": "projection", "input": "s",
+     "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]},
+    {"id": "f", "type": "filter", "input": "p", "references": ["a"]}
+  ],
+  "export": "f",
+  "columns": ["a"]
+}'
+# export 仍为 "f"，p 就地裁剪为只输出 a，added_projection 为 null
+```
+
+对照：筛选条件引用了**未选定**列 `b` 时，`b` 无法在上游消除，导出确实仍含 `b`，此时才追加
+尾部投影（`f__export`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/prune \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "a"}, {"name": "b"}]},
+    {"id": "f", "type": "filter", "input": "s", "references": ["b"]}
+  ],
+  "export": "f",
+  "columns": ["a"]
+}'
+# export 为 "f__export"，f 的 references 仍为 ["b"]，added_projection 为 "f__export"
+```
 
 ```bash
 # 2) 用原审查接口 POST /api/review 复审返回的精简图（需要 jq）
@@ -383,6 +425,34 @@ curl -s -X POST http://localhost:8080/api/prune \
 | jq '{nodes, export}' \
 | curl -s -X POST http://localhost:8080/api/review \
   -H 'Content-Type: application/json' --data @-
+```
+
+复审也可以直接把精简结果（或手写同构的图）POST 到 `/api/review`，下例即上面“投影就地缩列、
+筛选透传”的精简图，复审应得 `blocked: false`、只含选定列：
+
+```bash
+curl -s -X POST http://localhost:8080/api/review \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "a"}, {"name": "b"}]},
+    {"id": "p", "type": "projection", "input": "s",
+     "columns": [{"name": "a", "copy": "a"}]},
+    {"id": "f", "type": "filter", "input": "p", "references": ["a"]}
+  ],
+  "export": "f"
+}'
+```
+
+```json
+{
+  "export": "f",
+  "blocked": false,
+  "columns": [
+    {"name": "a", "blocked": false, "content_reasons": [], "row_reasons": []}
+  ]
+}
 ```
 
 选定列的原因与原图一致：若选定的是敏感列 `mail`，精简后复审仍判阻断（精简不“变安全”）：

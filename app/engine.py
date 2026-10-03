@@ -587,10 +587,12 @@ def prune(request: PruneRequest) -> dict[str, object]:
     every node's outputs are narrowed by it — the export projection/join is
     trimmed just like any other:
 
-    * source columns are never trimmed (a source/filter export therefore keeps
-      every column and needs a trailing projection to narrow the selection);
-    * a filter keeps its referenced columns and every column its consumers
-      need;
+    * source columns are never trimmed;
+    * a filter keeps its predicate columns and passes every surviving input
+      column straight through — a filter export therefore needs no trailing
+      projection when an upstream projection/join already shed the unselected
+      columns, and only needs one when the predicate (or a source column) still
+      keeps an unselected column alive;
     * a projection and a join emit only the outputs that are needed;
     * a retained projection/join with no demanded output keeps its original
       first output (and that output's dependencies) — the export itself never
@@ -599,10 +601,12 @@ def prune(request: PruneRequest) -> dict[str, object]:
       outputs demand no upstream content while their input relation is kept.
 
     A trailing projection (copying only the selected columns, in original
-    order) is appended solely when the export node still exposes columns the
-    caller did not select after the in-place narrowing. The result must stay
-    within the 60-node cap and re-review identically for the selected columns;
-    otherwise the request is rejected without any partial graph.
+    order) is appended solely when, after the in-place narrowing, the export
+    node still actually exposes columns the caller did not select — columns
+    can vanish on their way through a trimmed upstream projection/join even
+    when the export itself is a filter. The result must stay within the
+    60-node cap and re-review identically for the selected columns; otherwise
+    the request is rejected without any partial graph.
     """
     by_id, order, relations = _evaluate_graph(request)
     export_relation = relations[request.export]
@@ -707,16 +711,21 @@ def prune(request: PruneRequest) -> dict[str, object]:
 
     dropped_nodes = [node.id for node in request.nodes if node.id not in keep]
 
+    # --- evaluate the in-place-pruned graph before deciding on an append -----
+    # Whether the export still exposes unselected columns depends on the whole
+    # narrowed pipeline, not just the export node's type: a filter passes its
+    # input columns through, so columns already shed by an upstream trimmed
+    # projection/join do not reappear at a filter export. Build the candidate
+    # graph first and read the export's actual columns from its evaluation.
+    pre_payload = ReviewRequest.model_validate(
+        {"nodes": new_node_dicts, "export": request.export}
+    )
+    _pre_by_id, _pre_order, pre_relations = _evaluate_graph(pre_payload)
+    pre_export_columns = [c.name for c in pre_relations[request.export].columns]
+
+    needs_trailing = pre_export_columns != selected_in_order
+
     # --- trailing projection only if the export still exposes other columns -
-    # A trimmed projection/join export already exposes exactly the selection;
-    # source/filter exports cannot shed columns and therefore always need one
-    # when fewer than all columns were selected.
-    export_node = by_id[request.export]
-    if isinstance(export_node, (ProjectionNodeIn, JoinNodeIn)):
-        export_kept = demanded[request.export]
-    else:
-        export_kept = set(export_columns)
-    needs_trailing = export_kept != selected_set
     if needs_trailing and len(new_node_dicts) + 1 > NODE_LIMIT:
         raise ValidationError(
             "PRUNE_NODE_LIMIT",
@@ -749,7 +758,12 @@ def prune(request: PruneRequest) -> dict[str, object]:
     re_payload = ReviewRequest.model_validate(
         {"nodes": new_node_dicts, "export": final_export}
     )
-    pruned_review = review(re_payload)
+    if added_node:
+        pruned_review = review(re_payload)
+    else:
+        # No node was appended: reuse the candidate evaluation instead of
+        # walking the identical graph a second time.
+        pruned_review = _review_export(final_export, pre_relations)
 
     diffs = _compare_selected_columns(
         original_review, pruned_review, selected_in_order
