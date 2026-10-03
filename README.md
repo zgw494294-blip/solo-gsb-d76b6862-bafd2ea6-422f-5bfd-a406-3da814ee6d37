@@ -314,7 +314,10 @@ curl -s -i -X POST http://localhost:8080/api/revise \
      绝不产生空输出的非法节点（导出节点恒有选定列，不会落入此情形）。
 3. **尾部投影**：**仅当**裁剪后的导出节点仍含未选定列时，才在其后追加一个 ID 不与已有节点
    冲突的 `projection`（输入即原导出节点），只按**原列序** `copy` 选定列。投影/连接导出已
-   就地只剩选定列时**不追加**；source / filter 无法丢列，选定子集时必须追加。
+   就地只剩选定列时**不追加**；filter 节点本身不被修改，但它透传输入关系的列——上游投影/
+   连接就地缩列后，筛选导出同样只剩选定列，也**不追加**。只有导出实际仍含未选定列时才追加：
+   source 导出无法丢列，选定子集时必须追加；filter 导出的输入在裁剪后仍保留未选定列时
+   （输入是不可裁剪的 source，或筛选条件引用了未选定列而必须保留）同样需要追加。
 4. **节点上限**：仅在确需尾部投影（总节点数变为 61）时才以 `PRUNE_NODE_LIMIT` 拒绝；
    可就地缩列的 60 节点图成功返回，拒绝时不返回部分图。
 5. **保持不变量**：保留原节点 ID；保留节点在原请求中的相对顺序，以及节点内列/别名的相对顺序；
@@ -326,7 +329,8 @@ curl -s -i -X POST http://localhost:8080/api/revise \
 
 * 选定列名在导出节点上不存在（即使图本身安全也检查）：`PRUNE_COLUMN_NOT_FOUND`；
 * 裁剪后导出仍含未选定列、且追加尾部投影后节点数**超过 60**：`PRUNE_NODE_LIMIT`
-  （可就地缩列的 60 节点图不追加、不拒绝）；
+  （可就地缩列的 60 节点图不追加、不拒绝；上游缩列后经筛选透传只剩选定列的 60 节点
+  图同样成功返回）；
 * 构造出的精简图对选定列的复审与原图不一致：`PRUNE_REVIEW_MISMATCH`（内部不变量，正常不会出现）；
 * 以及 `/api/review` 的全部原图校验（`DUPLICATE_NODE` / `COLUMN_CONFLICT` /
   `INVALID_REFERENCE` / `CYCLE`）——整次请求先校验整张原图，无关分支的错误同样拒绝。
@@ -372,14 +376,76 @@ curl -s -X POST http://localhost:8080/api/prune \
 }
 ```
 
-> 若导出节点是 **source / filter**（无法丢列），选定子集时才会在末尾追加一个只复制选定列的
-> 投影（ID 形如 `<导出节点>__export`，冲突时自动换名），`added_projection` 返回其 ID。
+> 若导出节点是 **source**（无法丢列），或 **filter** 且裁剪后其输入仍含未选定列（例如输入
+> 是不可裁剪的 source，或筛选条件引用了未选定列），选定子集时才会在末尾追加一个只复制选定
+> 列的投影（ID 形如 `<导出节点>__export`，冲突时自动换名），`added_projection` 返回其 ID。
 
 ```bash
 # 2) 用原审查接口 POST /api/review 复审返回的精简图（需要 jq）
 curl -s -X POST http://localhost:8080/api/prune \
   -H 'Content-Type: application/json' \
   --data @examples/prune_request.json \
+| jq '{nodes, export}' \
+| curl -s -X POST http://localhost:8080/api/review \
+  -H 'Content-Type: application/json' --data @-
+```
+
+### 筛选导出：上游缩列后透传，不追加投影
+
+filter 导出并非必然追加投影。下例中导出筛选 `f` 的输入投影被就地裁剪到只剩 `a`，
+筛选透传后导出即只剩选定列，60 节点上限内也**不追加**、`added_projection` 为 `null`：
+
+```bash
+curl -s -X POST http://localhost:8080/api/prune \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "a"}, {"name": "b"}]},
+    {"id": "p", "type": "projection", "input": "s",
+     "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]},
+    {"id": "f", "type": "filter", "input": "p", "references": ["a"]}
+  ],
+  "export": "f",
+  "columns": ["a"]
+}'
+```
+
+返回（节选）：投影 `p` 就地只剩 `a`，导出仍是 `f`，未追加任何节点：
+
+```json
+{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "a"}, {"name": "b"}]},
+    {"id": "p", "type": "projection", "input": "s",
+     "columns": [{"name": "a", "copy": "a"}]},
+    {"id": "f", "type": "filter", "input": "p", "references": ["a"]}
+  ],
+  "export": "f",
+  "columns": ["a"],
+  "added_projection": null,
+  "review": {"export": "f", "blocked": false, "columns": [
+    {"name": "a", "blocked": false, "content_reasons": [], "row_reasons": []}]}
+}
+```
+
+用 POST /api/review 复审返回的精简图（需要 jq；应得 `"blocked": false`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/prune \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "a"}, {"name": "b"}]},
+    {"id": "p", "type": "projection", "input": "s",
+     "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]},
+    {"id": "f", "type": "filter", "input": "p", "references": ["a"]}
+  ],
+  "export": "f",
+  "columns": ["a"]
+}' \
 | jq '{nodes, export}' \
 | curl -s -X POST http://localhost:8080/api/review \
   -H 'Content-Type: application/json' --data @-

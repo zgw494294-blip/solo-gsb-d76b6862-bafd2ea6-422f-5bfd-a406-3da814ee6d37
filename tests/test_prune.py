@@ -212,6 +212,88 @@ def test_export_projection_demands_merge_with_shared_other_branch():
     assert res["export"] == "e" and res["added_projection"] is None
 
 
+def test_filter_export_appends_nothing_when_upstream_trims_to_selection():
+    # The reported bug: the projection feeding the filter export is narrowed
+    # to the selected column in place, and the filter passes that through, so
+    # the export already exposes exactly the selection — appending a trailing
+    # projection would be redundant.
+    payload = {
+        "nodes": [
+            {"id": "s", "type": "source",
+             "columns": [{"name": "a"}, {"name": "b"}]},
+            {"id": "p", "type": "projection", "input": "s",
+             "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]},
+            {"id": "f", "type": "filter", "input": "p", "references": ["a"]},
+        ],
+        "export": "f",
+        "columns": ["a"],
+    }
+    res = call_prune(payload)
+    assert res["export"] == "f"
+    assert res["added_projection"] is None
+    assert ids(res["nodes"]) == ["s", "p", "f"]
+    # The projection is trimmed in place; the filter node itself is untouched.
+    assert by_id(res["nodes"])["p"]["columns"] == [{"name": "a", "copy": "a"}]
+    assert by_id(res["nodes"])["f"]["references"] == ["a"]
+    assert [c["name"] for c in res["review"]["columns"]] == ["a"]
+
+
+def test_filter_export_over_trimmed_join_appends_nothing():
+    # Same pass-through through a filter, with the upstream narrowing done by
+    # a join: the join is trimmed to the demanded alias and the filter export
+    # then exposes exactly the selection.
+    payload = {
+        "nodes": [
+            {"id": "l", "type": "source",
+             "columns": [{"name": "k"}, {"name": "a"}, {"name": "b"}]},
+            {"id": "r", "type": "source", "columns": [{"name": "k"}]},
+            {"id": "j", "type": "join",
+             "left_input": "l", "right_input": "r",
+             "left_key": "k", "right_key": "k",
+             "outputs": [{"alias": "a", "side": "left", "column": "a"},
+                         {"alias": "b", "side": "left", "column": "b"}]},
+            {"id": "f", "type": "filter", "input": "j", "references": ["a"]},
+        ],
+        "export": "f",
+        "columns": ["a"],
+    }
+    res = call_prune(payload)
+    j = by_id(res["nodes"])["j"]
+    assert [o["alias"] for o in j["outputs"]] == ["a"]
+    assert j["left_key"] == "k" and j["right_key"] == "k"
+    assert res["export"] == "f" and res["added_projection"] is None
+    assert [c["name"] for c in res["review"]["columns"]] == ["a"]
+
+
+def test_filter_export_still_appends_when_unselected_columns_survive_upstream():
+    # Control case: the filter's condition references the unselected column
+    # 'b', so the upstream projection must keep it and the filter export still
+    # exposes it — a trailing projection remains necessary.
+    payload = {
+        "nodes": [
+            {"id": "s", "type": "source",
+             "columns": [{"name": "a"}, {"name": "b"}]},
+            {"id": "p", "type": "projection", "input": "s",
+             "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]},
+            {"id": "f", "type": "filter", "input": "p", "references": ["b"]},
+        ],
+        "export": "f",
+        "columns": ["a"],
+    }
+    res = call_prune(payload)
+    assert res["export"] == "f__export"
+    assert res["added_projection"] == "f__export"
+    # The reference to 'b' is preserved, so the projection keeps both columns...
+    assert by_id(res["nodes"])["p"]["columns"] == [
+        {"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]
+    assert by_id(res["nodes"])["f"]["references"] == ["b"]
+    # ...and the trailing projection narrows the export to the selection.
+    assert res["nodes"][-1] == {
+        "id": "f__export", "type": "projection", "input": "f",
+        "columns": [{"name": "a", "copy": "a"}]}
+    assert [c["name"] for c in res["review"]["columns"]] == ["a"]
+
+
 def test_source_export_subset_appends_projection_and_keeps_sensitive_flags():
     payload = {
         "nodes": [
@@ -637,21 +719,48 @@ def test_projection_chain_at_limit_trims_in_place_and_succeeds():
     assert [c["name"] for c in res["review"]["columns"]] == ["a"]
 
 
+def test_filter_export_at_limit_succeeds_when_upstream_trims_to_selection():
+    # The reported bug: 60 nodes — a source with a,b, one projection copying
+    # both columns, and 58 filters that only reference 'a'. The projection is
+    # narrowed to 'a' in place and every filter passes that through, so the
+    # filter export already exposes exactly the selection: no 61st node is
+    # needed and the request must succeed with the original export.
+    nodes = [
+        {"id": "s0", "type": "source",
+         "columns": [{"name": "a"}, {"name": "b"}]},
+        {"id": "n1", "type": "projection", "input": "s0",
+         "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]},
+    ]
+    for i in range(2, 60):
+        nodes.append({"id": f"n{i}", "type": "filter",
+                      "input": f"n{i - 1}", "references": ["a"]})
+    res = call_prune({"nodes": nodes, "export": "n59", "columns": ["a"]})
+    assert len(res["nodes"]) == 60
+    assert res["export"] == "n59"
+    assert res["added_projection"] is None
+    # The projection is trimmed to 'a'; the source keeps both columns; every
+    # filter passes the narrowed relation through with its condition intact.
+    assert by_id(res["nodes"])["n1"]["columns"] == [{"name": "a", "copy": "a"}]
+    assert by_id(res["nodes"])["s0"]["columns"] == [{"name": "a"}, {"name": "b"}]
+    for node in res["nodes"][2:]:
+        assert node["type"] == "filter" and node["references"] == ["a"]
+    assert [c["name"] for c in res["review"]["columns"]] == ["a"]
+
+
 def test_filter_export_subset_at_limit_rejected_without_partial_graph():
-    # A filter export cannot shed columns, so a subset genuinely needs the
-    # 61st node; the request is rejected without any partial graph.
+    # Genuine 61st-node case: a filter chain directly over a source. Neither
+    # sources nor filters can shed columns, so the export still exposes the
+    # unselected column and the trailing projection would be node 61; the
+    # request is rejected without any partial graph.
     nodes = [{"id": "s0", "type": "source",
               "columns": [{"name": "a"}, {"name": "b"}]}]
-    for i in range(1, 59):
+    for i in range(1, 60):
         nodes.append({
             "id": f"n{i}",
-            "type": "projection",
+            "type": "filter",
             "input": f"n{i - 1}" if i > 1 else "s0",
-            "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}],
+            "references": ["a"],
         })
-    nodes.append({
-        "id": "n59", "type": "filter", "input": "n58", "references": ["a"],
-    })
     exc = expect_engine_error(
         {"nodes": nodes, "export": "n59", "columns": ["a"]},
         "PRUNE_NODE_LIMIT",
@@ -866,17 +975,44 @@ def test_http_prune_unknown_column_returns_400_without_partial_graph():
     assert "nodes" not in body and "review" not in body
 
 
+def test_http_prune_filter_export_at_limit_returns_200_without_append():
+    # The reported bug: 60 nodes — source(a,b), one projection copying both
+    # columns, 58 filters referencing only 'a'. The projection is narrowed in
+    # place and the filters pass that through, so the filter export already
+    # exposes exactly the selection and no 61st node is needed.
+    nodes = [
+        {"id": "s0", "type": "source",
+         "columns": [{"name": "a"}, {"name": "b"}]},
+        {"id": "n1", "type": "projection", "input": "s0",
+         "columns": [{"name": "a", "copy": "a"}, {"name": "b", "copy": "b"}]},
+    ]
+    for i in range(2, 60):
+        nodes.append({"id": f"n{i}", "type": "filter",
+                      "input": f"n{i - 1}", "references": ["a"]})
+    resp = client.post("/api/prune",
+                       json={"nodes": nodes, "export": "n59", "columns": ["a"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["nodes"]) == 60
+    assert body["export"] == "n59"
+    assert body["added_projection"] is None
+    assert [c["name"] for c in body["review"]["columns"]] == ["a"]
+
+    follow = client.post("/api/review",
+                         json={"nodes": body["nodes"], "export": body["export"]})
+    assert follow.status_code == 200
+    assert [c["name"] for c in follow.json()["columns"]] == ["a"]
+
+
 def test_http_prune_node_limit_returns_400():
-    # A filter export cannot be narrowed in place, so a subset needs node 61.
+    # Genuine 61st-node case: filters chained directly over a source cannot
+    # shed the unselected column, so the trailing projection would be node 61.
     nodes = [{"id": "s0", "type": "source",
               "columns": [{"name": "a"}, {"name": "b"}]}]
-    for i in range(1, 59):
-        nodes.append({"id": f"n{i}", "type": "projection",
+    for i in range(1, 60):
+        nodes.append({"id": f"n{i}", "type": "filter",
                       "input": f"n{i - 1}" if i > 1 else "s0",
-                      "columns": [{"name": "a", "copy": "a"},
-                                  {"name": "b", "copy": "b"}]})
-    nodes.append({"id": "n59", "type": "filter", "input": "n58",
-                  "references": ["a"]})
+                      "references": ["a"]})
     resp = client.post("/api/prune",
                        json={"nodes": nodes, "export": "n59", "columns": ["a"]})
     assert resp.status_code == 400

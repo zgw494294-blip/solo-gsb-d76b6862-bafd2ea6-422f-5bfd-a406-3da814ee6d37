@@ -587,10 +587,12 @@ def prune(request: PruneRequest) -> dict[str, object]:
     every node's outputs are narrowed by it — the export projection/join is
     trimmed just like any other:
 
-    * source columns are never trimmed (a source/filter export therefore keeps
-      every column and needs a trailing projection to narrow the selection);
+    * source columns are never trimmed (a source export therefore keeps every
+      column and needs a trailing projection to narrow the selection);
     * a filter keeps its referenced columns and every column its consumers
-      need;
+      need, and passes through whatever its (possibly narrowed) input exposes
+      — a filter export may therefore already expose exactly the selection
+      once its upstream projection/join shed the unselected columns;
     * a projection and a join emit only the outputs that are needed;
     * a retained projection/join with no demanded output keeps its original
       first output (and that output's dependencies) — the export itself never
@@ -707,16 +709,31 @@ def prune(request: PruneRequest) -> dict[str, object]:
 
     dropped_nodes = [node.id for node in request.nodes if node.id not in keep]
 
+    # --- columns each retained node actually exposes after trimming ---------
+    # A filter passes through whatever its (possibly narrowed) input exposes,
+    # so a filter export can already expose exactly the selection once the
+    # upstream projection/join dropped the unselected columns. Projection and
+    # join nodes emit exactly their demanded outputs (first-output fallback
+    # included); sources are never trimmed.
+    exposed: dict[str, set[str]] = {}
+    for nid in order:
+        if nid not in keep:
+            continue
+        node = by_id[nid]
+        if isinstance(node, SourceNodeIn):
+            exposed[nid] = {c.name for c in node.columns}
+        elif isinstance(node, FilterNodeIn):
+            exposed[nid] = exposed[node.input]
+        else:  # projection/join emit exactly the demanded outputs
+            exposed[nid] = set(demanded[nid])
+
     # --- trailing projection only if the export still exposes other columns -
-    # A trimmed projection/join export already exposes exactly the selection;
-    # source/filter exports cannot shed columns and therefore always need one
-    # when fewer than all columns were selected.
-    export_node = by_id[request.export]
-    if isinstance(export_node, (ProjectionNodeIn, JoinNodeIn)):
-        export_kept = demanded[request.export]
-    else:
-        export_kept = set(export_columns)
-    needs_trailing = export_kept != selected_set
+    # A trimmed projection/join export already exposes exactly the selection,
+    # and so does a filter export whose upstream was narrowed down to it. Only
+    # when the export relation still carries unselected columns after the
+    # in-place narrowing (a source export, or a filter over columns that had
+    # to be kept) is a trailing projection appended.
+    needs_trailing = exposed[request.export] != selected_set
     if needs_trailing and len(new_node_dicts) + 1 > NODE_LIMIT:
         raise ValidationError(
             "PRUNE_NODE_LIMIT",
